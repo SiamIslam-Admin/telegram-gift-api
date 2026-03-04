@@ -1,146 +1,135 @@
 import os
-import asyncio
-from fastapi import FastAPI, Request
+import traceback
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
-from telethon import TelegramClient, events, functions, types, errors
 from dotenv import load_dotenv
+
+from pyrogram import Client, filters, errors, raw
+from pyrogram.types import Message
+
 import uvicorn
 
+# -------------------------
+# ENV
+# -------------------------
 load_dotenv()
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-SESSION_DIR = "/data/sessions"
-if not os.path.exists(SESSION_DIR):
-    os.makedirs(SESSION_DIR, exist_ok=True)
+if API_ID == 0 or not API_HASH or not BOT_TOKEN:
+    print("⚠️ Missing ENV! Please set API_ID, API_HASH, BOT_TOKEN in Railway Variables.")
 
-app = FastAPI()
+# -------------------------
+# SESSION STORAGE (Railway Volume)
+# -------------------------
+SESSION_DIR = os.getenv("SESSION_DIR", "/data/sessions")
+os.makedirs(SESSION_DIR, exist_ok=True)
 
-# ম্যানেজার বট ক্লায়েন্ট (টেলিথন)
-bot = TelegramClient(os.path.join(SESSION_DIR, "manager_bot"), API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+def session_file_exists(session_name: str) -> bool:
+    # Pyrogram stores as: <path>.session
+    p = os.path.join(SESSION_DIR, session_name)
+    return os.path.exists(p + ".session")
 
-user_states = {}
+def make_session_path(session_name: str) -> str:
+    # pass path WITHOUT ".session" to Client()
+    return os.path.join(SESSION_DIR, session_name)
 
-@app.get("/")
-async def home():
-    return {"status": "online", "engine": "Telethon", "message": "Star Gift API is ready!"}
+# -------------------------
+# MAIN BOT CLIENT (manager bot)
+# -------------------------
+app_bot = Client(
+    make_session_path("manager_bot"),
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
-# --- [API: গিফট পাঠানো] ---
-@app.get("/send-gift")
-async def send_gift(gift_id: int, target: str, session: str, message: str = "Enjoy!"):
-    session_path = os.path.join(SESSION_DIR, session)
-    if not os.path.exists(f"{session_path}.session"):
-        return JSONResponse(status_code=404, content={"error": f"Session '{session}' not found!"})
+user_sessions = {}  # in-memory state
 
-    # ক্লায়েন্ট চালু করা
-    client = TelegramClient(session_path, API_ID, API_HASH)
-    try:
-        await client.connect()
-        # গিফট পাঠানোর রিকোয়েস্ট (InputInvoiceStarGift)
-        # টেলিথনে আমরা সরাসরি ইনভোক ব্যবহার করি
-        result = await client(functions.payments.GetPaymentFormRequest(
-            invoice=types.InputInvoiceStarGift(
-                peer=target,
-                gift_id=gift_id,
-                message=types.TextWithEntities(text=message, entities=[])
-            )
-        ))
-        
-        form_id = result.form_id
-        await client(functions.payments.SendStarsFormRequest(
-            form_id=form_id,
-            invoice=types.InputInvoiceStarGift(
-                peer=target,
-                gift_id=gift_id,
-                message=types.TextWithEntities(text=message, entities=[])
-            )
-        ))
-        return {"status": "success", "message": f"Gift sent to {target}!"}
-    except errors.BalanceTooLowError:
-        return JSONResponse(status_code=402, content={"error": "Insufficient Stars!"})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-    finally:
-        await client.disconnect()
-
-# --- [BOT: সেশন তৈরি করা] ---
-@bot.on(events.NewMessage(pattern='/start'))
-async def start(event):
-    async with bot.conversation(event.chat_id) as conv:
-        await conv.send_message("👋 সেশন তৈরির জন্য একটি নাম দিন (যেমন: user1):")
-        name = (await conv.get_response()).text
-        
-        await conv.send_message("📞 আপনার ফোন নম্বর দিন (+880...):")
-        phone = (await conv.get_response()).text
-        
-        client = TelegramClient(os.path.join(SESSION_DIR, name), API_ID, API_HASH)
-        await client.connect()
-        
-        try:
-            if not await client.is_user_authorized():
-                await client.send_code_request(phone)
-                await conv.send_message("📩 OTP কোডটি দিন:")
-                code = (await conv.get_response()).text
-                try:
-                    await client.sign_in(phone, code)
-                except errors.SessionPasswordNeededError:
-                    await conv.send_message("🔐 2FA পাসওয়ার্ড দিন:")
-                    password = (await conv.get_response()).text
-                    await client.sign_in(password=password)
-            
-            await conv.send_message(f"✅ সেশন `{name}` সফলভাবে তৈরি হয়েছে!")
-        except Exception as e:
-            await conv.send_message(f"❌ এরর: {str(e)}")
-        finally:
-            await client.disconnect()
-
-# উভয় সার্ভিস একসাথে চালানো
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await app_bot.start()
+    print("✅ Telegram Bot Started!")
+    yield
+    await app_bot.stop()
 
 app = FastAPI(lifespan=lifespan)
-user_sessions = {}
 
+# -------------------------
+# HEALTH
+# -------------------------
 @app.get("/")
 async def home():
     import pyrogram
-    return {"status": "online", "version": pyrogram.__version__}
+    return {
+        "status": "online",
+        "pyrogram": pyrogram.__version__,
+        "session_dir": SESSION_DIR
+    }
 
+# -------------------------
+# API: SEND GIFT
+# -------------------------
 @app.api_route("/send-gift", methods=["GET", "POST"])
-async def send_gift_api(gift_id: int, target: str, session: str, message: str = "Enjoy!"):
+async def send_gift_api(
+    gift_id: str = Query(...),
+    target: str = Query(...),
+    session: str = Query(...),
+    message: str = Query("Enjoy!")
+):
     clean_target = target.replace("@", "").strip()
-    session_path = os.path.join(SESSION_DIR, session)
-    
-    if not os.path.exists(f"{session_path}.session"):
+    session_path = make_session_path(session)
+
+    if not os.path.exists(session_path + ".session"):
         return JSONResponse(status_code=404, content={"error": f"Session '{session}' not found!"})
 
     client = Client(session_path, api_id=API_ID, api_hash=API_HASH)
+
     try:
         await client.start()
+
+        # resolve peer
         peer = await client.resolve_peer(clean_target)
 
-        # Create Star Gift Invoice
+        # gift_id might be huge; raw api usually expects int
+        try:
+            gift_int = int(gift_id)
+        except ValueError:
+            return JSONResponse(status_code=400, content={"error": "gift_id must be numeric string"})
+
         invoice = raw.types.InputInvoiceStarGift(
-            peer=peer, 
-            gift_id=gift_id,
+            peer=peer,
+            gift_id=gift_int,
             message=raw.types.TextWithEntities(text=message, entities=[])
         )
 
         form = await client.invoke(raw.functions.payments.GetPaymentForm(invoice=invoice))
         form_id = getattr(form, "form_id", None) or getattr(form, "id", None)
-        
+
+        if not form_id:
+            return JSONResponse(status_code=500, content={"error": "Could not get form_id from payment form"})
+
         await client.invoke(raw.functions.payments.SendStarsForm(form_id=form_id, invoice=invoice))
+
         return {"status": "success", "message": f"Gift sent to {clean_target}!"}
 
     except Exception as e:
+        # print full trace to Railway logs
+        print("❌ /send-gift error:", str(e))
+        print(traceback.format_exc())
         return JSONResponse(status_code=500, content={"error": str(e)})
+
     finally:
-        if client.is_connected: 
+        if client.is_connected:
             await client.stop()
 
-# --- BOT HANDLERS ---
+# -------------------------
+# BOT HANDLERS (session maker)
+# -------------------------
 @app_bot.on_message(filters.command("start") & filters.private)
 async def start_cmd(c, m: Message):
     await m.reply("👋 Send a name to create a session.")
@@ -148,119 +137,76 @@ async def start_cmd(c, m: Message):
 @app_bot.on_message(filters.text & filters.private)
 async def handle_steps(c, m: Message):
     user_id = m.from_user.id
+
+    # Step 0: session name
     if user_id not in user_sessions:
         name = m.text.replace(" ", "_").strip()
+        if not name:
+            await m.reply("❌ Invalid name. Send again.")
+            return
+
         user_sessions[user_id] = {"name": name, "step": "phone"}
         await m.reply(f"📁 Name: `{name}`\nSend Phone Number:")
         return
-    
+
     state = user_sessions[user_id]
+
+    # Step 1: phone
     if state["step"] == "phone":
-        state["phone"] = m.text
-        path = os.path.join(SESSION_DIR, state["name"])
+        state["phone"] = m.text.strip()
+        path = make_session_path(state["name"])
+
         temp_client = Client(path, api_id=API_ID, api_hash=API_HASH)
         await temp_client.connect()
-        code = await temp_client.send_code(m.text)
-        state.update({"hash": code.phone_code_hash, "client": temp_client, "step": "otp"})
-        await m.reply("📩 OTP Sent!")
-    elif state["step"] == "otp":
+
+        code = await temp_client.send_code(state["phone"])
+        state.update({
+            "hash": code.phone_code_hash,
+            "client": temp_client,
+            "step": "otp"
+        })
+
+        await m.reply("📩 OTP Sent! Now send OTP:")
+        return
+
+    # Step 2: otp
+    if state["step"] == "otp":
         try:
-            await state["client"].sign_in(state["phone"], state["hash"], m.text)
+            await state["client"].sign_in(state["phone"], state["hash"], m.text.strip())
             await m.reply(f"✅ Session `{state['name']}` saved!")
             await state["client"].disconnect()
             del user_sessions[user_id]
+            return
+
         except errors.SessionPasswordNeeded:
             state["step"] = "2fa"
             await m.reply("🔐 Enter 2FA Password:")
-    elif state["step"] == "2fa":
-        await state["client"].check_password(m.text)
-        await m.reply(f"✅ Session `{state['name']}` saved!")
-        await state["client"].disconnect()
-        del user_sessions[user_id]
+            return
+
+        except Exception as e:
+            print("❌ OTP error:", str(e))
+            print(traceback.format_exc())
+            await m.reply(f"❌ OTP failed: {e}")
+            return
+
+    # Step 3: 2FA
+    if state["step"] == "2fa":
+        try:
+            await state["client"].check_password(m.text)
+            await m.reply(f"✅ Session `{state['name']}` saved!")
+            await state["client"].disconnect()
+            del user_sessions[user_id]
+            return
+        except Exception as e:
+            print("❌ 2FA error:", str(e))
+            print(traceback.format_exc())
+            await m.reply(f"❌ 2FA failed: {e}")
+            return
+
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
-app = FastAPI(lifespan=lifespan)
-user_sessions = {}
-
-# --- [API ENDPOINTS] ---
-
-@app.get("/")
-async def home():
-    import pyrogram
-    return {
-        "status": "online", 
-        "pyrogram_version": pyrogram.__version__,
-        "message": "Visit /send-gift to send star gifts."
-    }
-
-@app.api_route("/send-gift", methods=["GET", "POST"])
-async def send_gift_api(gift_id: int, target: str, session: str, message: str = "Enjoy!"):
-    clean_target = target.replace("@", "").strip()
-    session_path = os.path.join(SESSION_DIR, session)
-    
-    if not os.path.exists(f"{session_path}.session"):
-        return JSONResponse(status_code=404, content={"error": f"Session '{session}' not found!"})
-
-    client = Client(session_path, api_id=API_ID, api_hash=API_HASH)
-    try:
-        await client.start()
-        peer = await client.resolve_peer(clean_target)
-
-        # Force checking for Star Gift support
-        if not hasattr(raw.types, "InputInvoiceStarGift"):
-            return JSONResponse(status_code=500, content={
-                "error": "Pyrogram Version Error",
-                "details": "Star Gifts not supported in current library version. Please update requirements.txt"
-            })
-
-        invoice = raw.types.InputInvoiceStarGift(
-            peer=peer, 
-            gift_id=gift_id,
-            message=raw.types.TextWithEntities(text=message, entities=[])
-        )
-
-        form = await client.invoke(raw.functions.payments.GetPaymentForm(invoice=invoice))
-        form_id = getattr(form, "form_id", None) or getattr(form, "id", None)
-        
-        await client.invoke(raw.functions.payments.SendStarsForm(form_id=form_id, invoice=invoice))
-        return {"status": "success", "message": f"Gift sent to {clean_target}!"}
-
-    except Exception as e:
-        print(f"DEBUG_ERROR: {str(e)}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
-    finally:
-        if client.is_connected: 
-            await client.stop()
-
-# --- [BOT HANDLERS] ---
-
-@app_bot.on_message(filters.command("start") & filters.private)
-async def start_cmd(client, message: Message):
-    await message.reply("👋 **Session Manager**\nSend a name (e.g., `user01`) to start creating a session.")
-
-@app_bot.on_message(filters.text & filters.private)
-async def handle_steps(client, message: Message):
-    user_id = message.from_user.id
-    text = message.text
-
-    if user_id not in user_sessions:
-        name = text.replace(" ", "_").strip()
-        user_sessions[user_id] = {"name": name, "step": "phone"}
-        await message.reply(f"📁 Name: `{name}`\nNow send your **Phone Number** (+880...).")
-        return
-
-    state = user_sessions[user_id]
-    
-    if state["step"] == "phone":
-        state["phone"] = text
-        path = os.path.join(SESSION_DIR, state["name"])
-        temp_client = Client(path, api_id=API_ID, api_hash=API_HASH)
-        await temp_client.connect()
-        try:
-            code_info = await temp_client.send_code(text)
-            state.update({"hash": code_info.phone_code_hash, "client": temp_client, "step": "otp"})
+    port = int(os.environ.get("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)update({"hash": code_info.phone_code_hash, "client": temp_client, "step": "otp"})
             await message.reply("📩 **OTP Sent!** Enter it here:")
         except Exception as e:
             await message.reply(f"❌ Error: {e}")
@@ -290,5 +236,6 @@ async def handle_steps(client, message: Message):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
