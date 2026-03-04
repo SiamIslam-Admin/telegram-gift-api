@@ -2,4 +2,4 @@ fastapi
 uvicorn
 python-dotenv
 tgcrypto
-git+https://github.com
+https://github.com
