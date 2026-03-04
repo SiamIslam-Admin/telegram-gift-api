@@ -8,39 +8,138 @@ from pyrogram.types import Message
 from dotenv import load_dotenv
 import uvicorn
 
-# এনভায়রনমেন্ট ভেরিয়েবল লোড
+# Load Environment Variables
 load_dotenv()
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# ভলিউম পাথ
+# Persistent Volume Path
 SESSION_DIR = "/data/sessions"
 if not os.path.exists(SESSION_DIR):
     os.makedirs(SESSION_DIR, exist_ok=True)
 
-# ক্লায়েন্ট অবজেক্টগুলো তৈরি
-app_bot = Client(os.path.join(SESSION_DIR, "manager_bot"), api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# Main Bot Client
+app_bot = Client(
+    os.path.join(SESSION_DIR, "manager_bot"), 
+    api_id=API_ID, 
+    api_hash=API_HASH, 
+    bot_token=BOT_TOKEN
+)
 
-# Lifespan Handler: অ্যাপ স্টার্ট হওয়ার সময় বট রান করবে
+# Startup/Shutdown Handler
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # বট স্টার্ট
     await app_bot.start()
-    print("✅ Telegram Bot Started!")
+    print("✅ Session Generator Bot is Online!")
     yield
-    # বট স্টপ
     await app_bot.stop()
     print("🛑 Bot Stopped!")
 
 app = FastAPI(lifespan=lifespan)
-
 user_sessions = {}
 
-# --- [হোম রুট - যেন ৪0৪ না আসে] ---
+# --- [ROUTES] ---
+
 @app.get("/")
 async def home():
+    return {"status": "ok", "message": "Telegram Gift API & Bot is running!"}
+
+@app.get("/list-sessions")
+async def list_sessions():
+    files = [f.replace(".session", "") for f in os.listdir(SESSION_DIR) if f.endswith(".session")]
+    return {"total": len(files), "sessions": files}
+
+@app.get("/send-gift")
+async def send_gift_api(gift_id: int, target: str, session: str, message: str = "Enjoy!"):
+    session_path = os.path.join(SESSION_DIR, session)
+    if not os.path.exists(f"{session_path}.session"):
+        return JSONResponse(status_code=404, content={"error": f"Session '{session}' not found!"})
+
+    client = Client(session_path, api_id=API_ID, api_hash=API_HASH)
+    try:
+        await client.start()
+        peer = await client.resolve_peer(target)
+        
+        # Using raw.types with a check for Star Gift support
+        try:
+            invoice = raw.types.InputInvoiceStarGift(
+                peer=peer, 
+                gift_id=gift_id,
+                message=raw.types.TextWithEntities(text=message, entities=[])
+            )
+        except AttributeError:
+            return JSONResponse(status_code=500, content={"error": "Pyrogram version is too old. Please update requirements.txt to git+https."})
+
+        form = await client.invoke(raw.functions.payments.GetPaymentForm(invoice=invoice))
+        form_id = getattr(form, "form_id", None) or getattr(form, "id", None)
+        
+        await client.invoke(raw.functions.payments.SendStarsForm(form_id=form_id, invoice=invoice))
+        return {"status": "success", "message": f"Gift sent to {target} successfully!"}
+    
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "details": str(e)})
+    finally:
+        if client.is_connected: 
+            await client.stop()
+
+# --- [BOT HANDLERS] ---
+
+@app_bot.on_message(filters.command("start") & filters.private)
+async def start_cmd(client, message: Message):
+    await message.reply("👋 **Welcome!**\nSend a unique name (e.g., `user_01`) to start creating a session.")
+
+@app_bot.on_message(filters.text & filters.private)
+async def handle_steps(client, message: Message):
+    user_id = message.from_user.id
+    text = message.text
+
+    if user_id not in user_sessions:
+        name = text.replace(" ", "_").strip()
+        user_sessions[user_id] = {"name": name, "step": "phone"}
+        await message.reply(f"📁 Session Name: `{name}`\nNow send your **Phone Number** (e.g., +88017...).")
+        return
+
+    state = user_sessions[user_id]
+    
+    if state["step"] == "phone":
+        state["phone"] = text
+        path = os.path.join(SESSION_DIR, state["name"])
+        temp_client = Client(path, api_id=API_ID, api_hash=API_HASH)
+        await temp_client.connect()
+        try:
+            code_info = await temp_client.send_code(text)
+            state.update({"hash": code_info.phone_code_hash, "client": temp_client, "step": "otp"})
+            await message.reply("📩 **OTP Sent!** Enter the code here:")
+        except Exception as e:
+            await message.reply(f"❌ Error: {e}")
+            await temp_client.disconnect()
+            del user_sessions[user_id]
+
+    elif state["step"] == "otp":
+        try:
+            await state["client"].sign_in(state["phone"], state["hash"], text)
+            await message.reply(f"✅ Session `{state['name']}` saved permanently!")
+            await state["client"].disconnect()
+            del user_sessions[user_id]
+        except errors.SessionPasswordNeeded:
+            state["step"] = "2fa"
+            await message.reply("🔐 **2FA Required!** Enter your cloud password:")
+        except Exception as e:
+            await message.reply(f"❌ Error: {e}")
+
+    elif state["step"] == "2fa":
+        try:
+            await state["client"].check_password(text)
+            await message.reply(f"✅ Session `{state['name']}` verified and saved!")
+            await state["client"].disconnect()
+            del user_sessions[user_id]
+        except Exception as e:
+            await message.reply(f"❌ Wrong Password: {e}")
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
     return {"status": "ok", "message": "Server is running perfectly!"}
 
 # --- [বট সেকশন] ---
@@ -122,3 +221,4 @@ async def send_gift_api(gift_id: int, target: str, session: str, message: str = 
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
