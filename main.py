@@ -15,12 +15,12 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# Persistent Volume Path (Must be mounted in Railway)
+# Persistent Volume Path
 SESSION_DIR = "/data/sessions"
 if not os.path.exists(SESSION_DIR):
     os.makedirs(SESSION_DIR, exist_ok=True)
 
-# Main Bot Client for session generation
+# Main Bot Client
 app_bot = Client(
     os.path.join(SESSION_DIR, "manager_bot"), 
     api_id=API_ID, 
@@ -31,9 +31,90 @@ app_bot = Client(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await app_bot.start()
-    print("✅ System Online and Bot Started!")
+    print("✅ System Online!")
     yield
     await app_bot.stop()
+
+app = FastAPI(lifespan=lifespan)
+user_sessions = {}
+
+@app.get("/")
+async def home():
+    import pyrogram
+    return {"status": "online", "version": pyrogram.__version__}
+
+@app.api_route("/send-gift", methods=["GET", "POST"])
+async def send_gift_api(gift_id: int, target: str, session: str, message: str = "Enjoy!"):
+    clean_target = target.replace("@", "").strip()
+    session_path = os.path.join(SESSION_DIR, session)
+    
+    if not os.path.exists(f"{session_path}.session"):
+        return JSONResponse(status_code=404, content={"error": f"Session '{session}' not found!"})
+
+    client = Client(session_path, api_id=API_ID, api_hash=API_HASH)
+    try:
+        await client.start()
+        peer = await client.resolve_peer(clean_target)
+
+        # Create Star Gift Invoice
+        invoice = raw.types.InputInvoiceStarGift(
+            peer=peer, 
+            gift_id=gift_id,
+            message=raw.types.TextWithEntities(text=message, entities=[])
+        )
+
+        form = await client.invoke(raw.functions.payments.GetPaymentForm(invoice=invoice))
+        form_id = getattr(form, "form_id", None) or getattr(form, "id", None)
+        
+        await client.invoke(raw.functions.payments.SendStarsForm(form_id=form_id, invoice=invoice))
+        return {"status": "success", "message": f"Gift sent to {clean_target}!"}
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        if client.is_connected: 
+            await client.stop()
+
+# --- BOT HANDLERS ---
+@app_bot.on_message(filters.command("start") & filters.private)
+async def start_cmd(c, m: Message):
+    await m.reply("👋 Send a name to create a session.")
+
+@app_bot.on_message(filters.text & filters.private)
+async def handle_steps(c, m: Message):
+    user_id = m.from_user.id
+    if user_id not in user_sessions:
+        name = m.text.replace(" ", "_").strip()
+        user_sessions[user_id] = {"name": name, "step": "phone"}
+        await m.reply(f"📁 Name: `{name}`\nSend Phone Number:")
+        return
+    
+    state = user_sessions[user_id]
+    if state["step"] == "phone":
+        state["phone"] = m.text
+        path = os.path.join(SESSION_DIR, state["name"])
+        temp_client = Client(path, api_id=API_ID, api_hash=API_HASH)
+        await temp_client.connect()
+        code = await temp_client.send_code(m.text)
+        state.update({"hash": code.phone_code_hash, "client": temp_client, "step": "otp"})
+        await m.reply("📩 OTP Sent!")
+    elif state["step"] == "otp":
+        try:
+            await state["client"].sign_in(state["phone"], state["hash"], m.text)
+            await m.reply(f"✅ Session `{state['name']}` saved!")
+            await state["client"].disconnect()
+            del user_sessions[user_id]
+        except errors.SessionPasswordNeeded:
+            state["step"] = "2fa"
+            await m.reply("🔐 Enter 2FA Password:")
+    elif state["step"] == "2fa":
+        await state["client"].check_password(m.text)
+        await m.reply(f"✅ Session `{state['name']}` saved!")
+        await state["client"].disconnect()
+        del user_sessions[user_id]
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
 app = FastAPI(lifespan=lifespan)
 user_sessions = {}
@@ -144,3 +225,4 @@ async def handle_steps(client, message: Message):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
