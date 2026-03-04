@@ -11,36 +11,18 @@ from pyrogram.types import Message
 
 import uvicorn
 
-# -------------------------
-# ENV
-# -------------------------
 load_dotenv()
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-if API_ID == 0 or not API_HASH or not BOT_TOKEN:
-    print("⚠️ Missing ENV! Please set API_ID, API_HASH, BOT_TOKEN in Railway Variables.")
-
-# -------------------------
-# SESSION STORAGE (Railway Volume)
-# -------------------------
 SESSION_DIR = os.getenv("SESSION_DIR", "/data/sessions")
 os.makedirs(SESSION_DIR, exist_ok=True)
 
-def session_file_exists(session_name: str) -> bool:
-    # Pyrogram stores as: <path>.session
-    p = os.path.join(SESSION_DIR, session_name)
-    return os.path.exists(p + ".session")
+def make_session_path(name: str) -> str:
+    return os.path.join(SESSION_DIR, name)
 
-def make_session_path(session_name: str) -> str:
-    # pass path WITHOUT ".session" to Client()
-    return os.path.join(SESSION_DIR, session_name)
-
-# -------------------------
-# MAIN BOT CLIENT (manager bot)
-# -------------------------
 app_bot = Client(
     make_session_path("manager_bot"),
     api_id=API_ID,
@@ -48,7 +30,7 @@ app_bot = Client(
     bot_token=BOT_TOKEN
 )
 
-user_sessions = {}  # in-memory state
+user_sessions = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -59,21 +41,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# -------------------------
-# HEALTH
-# -------------------------
 @app.get("/")
 async def home():
     import pyrogram
-    return {
-        "status": "online",
-        "pyrogram": pyrogram.__version__,
-        "session_dir": SESSION_DIR
-    }
+    return {"status": "online", "pyrogram": pyrogram.__version__}
 
-# -------------------------
-# API: SEND GIFT
-# -------------------------
 @app.api_route("/send-gift", methods=["GET", "POST"])
 async def send_gift_api(
     gift_id: str = Query(...),
@@ -91,15 +63,12 @@ async def send_gift_api(
 
     try:
         await client.start()
-
-        # resolve peer
         peer = await client.resolve_peer(clean_target)
 
-        # gift_id might be huge; raw api usually expects int
         try:
             gift_int = int(gift_id)
         except ValueError:
-            return JSONResponse(status_code=400, content={"error": "gift_id must be numeric string"})
+            return JSONResponse(status_code=400, content={"error": "gift_id must be numeric"})
 
         invoice = raw.types.InputInvoiceStarGift(
             peer=peer,
@@ -111,14 +80,12 @@ async def send_gift_api(
         form_id = getattr(form, "form_id", None) or getattr(form, "id", None)
 
         if not form_id:
-            return JSONResponse(status_code=500, content={"error": "Could not get form_id from payment form"})
+            return JSONResponse(status_code=500, content={"error": "Payment form_id missing"})
 
         await client.invoke(raw.functions.payments.SendStarsForm(form_id=form_id, invoice=invoice))
-
         return {"status": "success", "message": f"Gift sent to {clean_target}!"}
 
     except Exception as e:
-        # print full trace to Railway logs
         print("❌ /send-gift error:", str(e))
         print(traceback.format_exc())
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -127,9 +94,8 @@ async def send_gift_api(
         if client.is_connected:
             await client.stop()
 
-# -------------------------
-# BOT HANDLERS (session maker)
-# -------------------------
+# --- BOT HANDLERS ---
+
 @app_bot.on_message(filters.command("start") & filters.private)
 async def start_cmd(c, m: Message):
     await m.reply("👋 Send a name to create a session.")
@@ -138,20 +104,14 @@ async def start_cmd(c, m: Message):
 async def handle_steps(c, m: Message):
     user_id = m.from_user.id
 
-    # Step 0: session name
     if user_id not in user_sessions:
         name = m.text.replace(" ", "_").strip()
-        if not name:
-            await m.reply("❌ Invalid name. Send again.")
-            return
-
         user_sessions[user_id] = {"name": name, "step": "phone"}
         await m.reply(f"📁 Name: `{name}`\nSend Phone Number:")
         return
 
     state = user_sessions[user_id]
 
-    # Step 1: phone
     if state["step"] == "phone":
         state["phone"] = m.text.strip()
         path = make_session_path(state["name"])
@@ -159,9 +119,9 @@ async def handle_steps(c, m: Message):
         temp_client = Client(path, api_id=API_ID, api_hash=API_HASH)
         await temp_client.connect()
 
-        code = await temp_client.send_code(state["phone"])
+        code_info = await temp_client.send_code(state["phone"])
         state.update({
-            "hash": code.phone_code_hash,
+            "hash": code_info.phone_code_hash,
             "client": temp_client,
             "step": "otp"
         })
@@ -169,7 +129,6 @@ async def handle_steps(c, m: Message):
         await m.reply("📩 OTP Sent! Now send OTP:")
         return
 
-    # Step 2: otp
     if state["step"] == "otp":
         try:
             await state["client"].sign_in(state["phone"], state["hash"], m.text.strip())
@@ -177,19 +136,16 @@ async def handle_steps(c, m: Message):
             await state["client"].disconnect()
             del user_sessions[user_id]
             return
-
         except errors.SessionPasswordNeeded:
             state["step"] = "2fa"
             await m.reply("🔐 Enter 2FA Password:")
             return
-
         except Exception as e:
             print("❌ OTP error:", str(e))
             print(traceback.format_exc())
             await m.reply(f"❌ OTP failed: {e}")
             return
 
-    # Step 3: 2FA
     if state["step"] == "2fa":
         try:
             await state["client"].check_password(m.text)
@@ -206,36 +162,4 @@ async def handle_steps(c, m: Message):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
-    uvicorn.run(app, host="0.0.0.0", port=port)update({"hash": code_info.phone_code_hash, "client": temp_client, "step": "otp"})
-            await message.reply("📩 **OTP Sent!** Enter it here:")
-        except Exception as e:
-            await message.reply(f"❌ Error: {e}")
-            await temp_client.disconnect()
-            del user_sessions[user_id]
-
-    elif state["step"] == "otp":
-        try:
-            await state["client"].sign_in(state["phone"], state["hash"], text)
-            await message.reply(f"✅ Session `{state['name']}` saved!")
-            await state["client"].disconnect()
-            del user_sessions[user_id]
-        except errors.SessionPasswordNeeded:
-            state["step"] = "2fa"
-            await message.reply("🔐 **2FA Required!** Enter password:")
-        except Exception as e:
-            await message.reply(f"❌ Error: {e}")
-
-    elif state["step"] == "2fa":
-        try:
-            await state["client"].check_password(text)
-            await message.reply(f"✅ Session `{state['name']}` saved!")
-            await state["client"].disconnect()
-            del user_sessions[user_id]
-        except Exception as e:
-            await message.reply(f"❌ Wrong Password: {e}")
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
-
-
+    uvicorn.run(app, host="0.0.0.0", port=port)
