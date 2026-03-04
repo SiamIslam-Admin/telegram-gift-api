@@ -1,6 +1,5 @@
 fastapi
 uvicorn
-pyrogram
-tgcrypto
 python-dotenv
-
+tgcrypto
+https://github.com
