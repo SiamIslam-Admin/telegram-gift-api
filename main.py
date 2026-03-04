@@ -1,5 +1,6 @@
 import os
 import asyncio
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pyrogram import Client, filters, errors, raw
@@ -14,23 +15,40 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# ভলিউম পাথ (পার্মানেন্ট স্টোরেজ)
+# ভলিউম পাথ
 SESSION_DIR = "/data/sessions"
 if not os.path.exists(SESSION_DIR):
     os.makedirs(SESSION_DIR, exist_ok=True)
 
-app = FastAPI()
-# বটের নিজস্ব সেশনও ভলিউমে থাকবে
-bot = Client(os.path.join(SESSION_DIR, "manager_bot"), api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# ক্লায়েন্ট অবজেক্টগুলো তৈরি
+app_bot = Client(os.path.join(SESSION_DIR, "manager_bot"), api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# Lifespan Handler: অ্যাপ স্টার্ট হওয়ার সময় বট রান করবে
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # বট স্টার্ট
+    await app_bot.start()
+    print("✅ Telegram Bot Started!")
+    yield
+    # বট স্টপ
+    await app_bot.stop()
+    print("🛑 Bot Stopped!")
+
+app = FastAPI(lifespan=lifespan)
 
 user_sessions = {}
 
-# --- [বট সেকশন: সেশন তৈরি করা] ---
-@bot.on_message(filters.command("start") & filters.private)
-async def start(client, message: Message):
-    await message.reply("👋 একটি ইউনিক নাম দিন (যেমন: `user1`) সেশন তৈরির জন্য।")
+# --- [হোম রুট - যেন ৪0৪ না আসে] ---
+@app.get("/")
+async def home():
+    return {"status": "ok", "message": "Server is running perfectly!"}
 
-@bot.on_message(filters.text & filters.private)
+# --- [বট সেকশন] ---
+@app_bot.on_message(filters.command("start") & filters.private)
+async def start(client, message: Message):
+    await message.reply("👋 একটি নাম দিন সেশন তৈরির জন্য।")
+
+@app_bot.on_message(filters.text & filters.private)
 async def handle_auth(client, message: Message):
     user_id = message.from_user.id
     text = message.text
@@ -38,7 +56,7 @@ async def handle_auth(client, message: Message):
     if user_id not in user_sessions:
         session_name = text.replace(" ", "_").strip()
         user_sessions[user_id] = {"name": session_name, "step": "phone"}
-        await message.reply(f"📁 সেশন নাম: `{session_name}`\nএখন ফোন নম্বর দিন (যেমন: +88017...)।")
+        await message.reply(f"📁 সেশন নাম: `{session_name}`\nফোন নম্বর দিন (যেমন: +88017...)।")
         return
 
     state = user_sessions[user_id]
@@ -60,7 +78,7 @@ async def handle_auth(client, message: Message):
     elif state["step"] == "otp":
         try:
             await state["client"].sign_in(state["phone"], state["hash"], text)
-            await message.reply(f"✅ সেশন `{state['name']}` সফলভাবে তৈরি ও সেভ হয়েছে!")
+            await message.reply(f"✅ সেশন `{state['name']}` সফলভাবে সেভ হয়েছে!")
             await state["client"].disconnect()
             del user_sessions[user_id]
         except errors.SessionPasswordNeeded:
@@ -78,13 +96,12 @@ async def handle_auth(client, message: Message):
         except Exception as e:
             await message.reply(f"❌ পাসওয়ার্ড ভুল: {e}")
 
-# --- [API সেকশন: গিফট পাঠানো] ---
+# --- [API সেকশন] ---
 @app.get("/send-gift")
 async def send_gift_api(gift_id: int, target: str, session: str, message: str = "Enjoy!"):
-    # ভলিউম থেকে সেশন ফাইল খুঁজবে
     session_path = os.path.join(SESSION_DIR, session)
     if not os.path.exists(f"{session_path}.session"):
-        return JSONResponse(status_code=404, content={"error": "Session file not found in storage!"})
+        return JSONResponse(status_code=404, content={"error": f"Session {session} not found!"})
 
     client = Client(session_path, api_id=API_ID, api_hash=API_HASH)
     try:
@@ -103,8 +120,5 @@ async def send_gift_api(gift_id: int, target: str, session: str, message: str = 
     finally:
         if client.is_connected: await client.stop()
 
-# --- [রান করার কমান্ড] ---
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.create_task(bot.start()) 
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
